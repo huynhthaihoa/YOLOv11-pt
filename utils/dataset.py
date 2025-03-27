@@ -207,8 +207,11 @@ class Dataset(data.Dataset):
     @staticmethod
     def load_label(filenames):
         path = f'{os.path.dirname(filenames[0])}_yolov11pt.cache'
-        if os.path.exists(path):
-            return torch.load(path)
+        try:
+            if os.path.exists(path):
+                return torch.load(path)
+        except:
+            pass
         x = {}
         for filename in filenames:
             try:
