@@ -14,13 +14,16 @@ def convert_arg_line_to_args(arg_line):
             continue
         yield arg
 
-def setup_seed():
+def setup_seed(seed):
     """
     Setup random seed.
     """
-    random.seed(0)
-    numpy.random.seed(0)
-    torch.manual_seed(0)
+    random.seed(seed)
+    numpy.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
 
@@ -423,7 +426,7 @@ class CosineLR:
 
 
 class LinearLR:
-    def __init__(self, args, params, num_steps):
+    def __init__(self, args, num_steps):
         max_lr = args.max_lr
         min_lr = args.min_lr
 
@@ -767,8 +770,8 @@ class ComputeLoss:
                                                target_scores,
                                                target_scores_sum, fg_mask)
 
-        loss_box *= self.args.box  # box gain
-        loss_cls *= self.args.cls  # cls gain
-        loss_dfl *= self.args.dfl  # dfl gain
+        loss_box *= self.params.box  # box gain
+        loss_cls *= self.params.cls  # cls gain
+        loss_dfl *= self.params.dfl  # dfl gain
 
         return loss_box, loss_cls, loss_dfl

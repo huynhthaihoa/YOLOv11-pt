@@ -7,25 +7,32 @@ import numpy
 import torch
 from PIL import Image
 from torch.utils import data
+from glob import glob
+from natsort import natsorted
 
 FORMATS = 'bmp', 'dng', 'jpeg', 'jpg', 'mpo', 'png', 'tif', 'tiff', 'webp'
 
 
 class Dataset(data.Dataset):
-    def __init__(self, params):# filenames, input_size, params, augment):
+    def __init__(self, params, for_training=True, use_augment=True):# filenames, input_size, params, augment):
         self.params = params
         self.mosaic = self.params.use_augment
-        self.augment = self.params.use_augment
+        self.augment = use_augment#self.params.use_augment
         self.input_size = self.params.input_size
 
         # Read labels
-        labels = self.load_label(self.params.filenames)
+        if for_training:
+            self.filenames = natsorted(glob(f"{self.params.train_dir}/*.jpg"))
+        else:
+            self.filenames = natsorted(glob(f"{self.params.val_dir}/*.jpg"))
+        
+        labels = self.load_label(self.filenames)
         self.labels = list(labels.values())
         self.filenames = list(labels.keys())  # update
         self.n = len(self.filenames)  # number of samples
         self.indices = range(self.n)
-        # Albumentations (optional, only used if package is installed)
         
+        # Albumentations (optional, only used if package is installed)
         if self.params.use_albumentations:
             self.albumentations = Albumentations()
 
@@ -199,7 +206,7 @@ class Dataset(data.Dataset):
 
     @staticmethod
     def load_label(filenames):
-        path = f'{os.path.dirname(filenames[0])}.cache'
+        path = f'{os.path.dirname(filenames[0])}_yolov11pt.cache'
         if os.path.exists(path):
             return torch.load(path)
         x = {}

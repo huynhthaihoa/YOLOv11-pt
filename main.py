@@ -3,6 +3,7 @@ import csv
 import os
 import sys
 import warnings
+import time
 from argparse import ArgumentParser
 
 import torch
@@ -62,13 +63,14 @@ def train(args):#, params):
     ema = util.EMA(model) if args.local_rank == 0 else None
 
     # Dataset
-    filenames = []
+    # filenames = []
     # with open(f'{data_dir}/train2017.txt') as f:
     #     for filename in f.readlines():
     #         filename = os.path.basename(filename.rstrip())
     #         filenames.append(f'{data_dir}/images/train2017/' + filename)
 
     sampler = None
+    
     dataset = Dataset(args)#filenames, args.input_size, args, augment=True)
 
     if args.distributed:
@@ -94,7 +96,7 @@ def train(args):#, params):
     amp_scale = torch.amp.GradScaler()
     criterion = util.ComputeLoss(model, args)
 
-    with open('weights/step.csv', 'w') as log:
+    with open(f'{args.log_dir}/step.csv', 'w') as log:
         if args.local_rank == 0:
             logger = csv.DictWriter(log, fieldnames=['epoch',
                                                      'box', 'cls', 'dfl',
@@ -187,22 +189,22 @@ def train(args):#, params):
                     if last[i] > best[i]:
                         # Delete old best (if exists) and save new best
                         if best[i] != -1:
-                            os.system(f'rm ./weights/best_{metric}_{best[i]}.pt')
+                            os.system(f'rm {args.log_dir}/best_{metric}_{best[i]}.pt')
                         best[i] = last[i]
-                        torch.save(save, f=f'./weights/best_{metric}_{best[i]}.pt')
+                        torch.save(save, f=f'{args.log_dir}/best_{metric}_{best[i]}.pt')
 
                     # Delete old last (if exists) and save new last
                     if cache_last[i] != -1:
-                        os.system(f'rm ./weights/last_{metric}_{cache_last[i]}.pt')
+                        os.system(f'rm {args.log_dir}/last_{metric}_{cache_last[i]}.pt')
                     cache_last[i] = last[i]
-                    torch.save(save, f=f'./weights/last_{metric}_{cache_last[i]}.pt')
+                    torch.save(save, f=f'{args.log_dir}/last_{metric}_{cache_last[i]}.pt')
 
                     del save
 
     if args.local_rank == 0:
         for i, metric in enumerate(metrics):
-            util.strip_optimizer(f'./weights/best_{metric}_{best[i]}.pt')  # strip optimizers
-            util.strip_optimizer(f'./weights/last_{metric}_{cache_last[i]}.pt')  # strip optimizers
+            util.strip_optimizer(f'{args.log_dir}/best_{metric}_{best[i]}.pt')  # strip optimizers
+            util.strip_optimizer(f'{args.log_dir}/last_{metric}_{cache_last[i]}.pt')  # strip optimizers
 
 @torch.no_grad()
 def test(args, model=None):
@@ -212,7 +214,7 @@ def test(args, model=None):
     #         filename = os.path.basename(filename.rstrip())
     #         filenames.append(f'{data_dir}/images/val2017/' + filename)
 
-    dataset = Dataset(args)#filenames, args.input_size, augment=args.use_augment)
+    dataset = Dataset(args, for_training=False, use_augment=False)#filenames, args.input_size, augment=args.use_augment)
     loader = data.DataLoader(dataset, batch_size=4, shuffle=False, num_workers=4,
                              pin_memory=True, collate_fn=Dataset.collate_fn)
 
@@ -312,33 +314,41 @@ def main():
     
     parser.add_argument('-c', '--config', help="configuration file *.yml", type=str, required=False, default='')
 
+    # Seed value
+    parser.add_argument('--seed', type=int, help='Seed value', default=42)
+
     parser.add_argument('--variant', default='n', type=str)
     parser.add_argument('--pretrained', action='store_true')
 
     parser.add_argument('--names',                            help='Class list (default is [])',                              default = [], type=lambda s: [str(item) for item in s.split(',')])
 
-    parser.add_argument('--input-size', default=640, type=int)
-    parser.add_argument('--batch-size', default=32, type=int)
-    parser.add_argument('--local-rank', default=0, type=int)
+    parser.add_argument('--input_size', default=640, type=int)
+    parser.add_argument('--batch_size', default=32, type=int)
     parser.add_argument('--local_rank', default=0, type=int)
     parser.add_argument('--epochs', default=600, type=int)
     
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--test', action='store_true')
+
+    # Load training data
+    parser.add_argument('--train_dir',                 type=str,   help='path to the training data', required=False)
+    parser.add_argument('--val_dir',                   type=str,   help='path to the validation data', required=False)
+
+    # Log and save
+    parser.add_argument('--log_dir',                   type=str,   help='directory to save checkpoints and summaries', default='')
         
     # training hyperparams
     parser.add_argument('--min_lr', default=1e-4, type=float)
     parser.add_argument('--max_lr', default=1e-2, type=float)
     parser.add_argument('--momentum', default=0.937, type=float)
-    parser.add_argument('--weight-decay', default=5e-4, type=float)
-    parser.add_argument('--warmup-epochs', default=3, type=int)
+    parser.add_argument('--weight_decay', default=5e-4, type=float)
+    parser.add_argument('--warmup_epochs', default=3, type=int)
     parser.add_argument('--box', default=0.05, type=float)
     parser.add_argument('--cls', default=0.5, type=float)
     parser.add_argument('--dfl', default=0.5, type=float)
-    
+   
     # augmentation hyperparams
     parser.add_argument('--use_augment', action='store_true')
-
     parser.add_argument('--hsv_h', default=0.015, type=float)
     parser.add_argument('--hsv_s', default=0.7, type=float)
     parser.add_argument('--hsv_v', default=0.4, type=float)
@@ -350,6 +360,7 @@ def main():
     parser.add_argument('--flip_lr', default=0.0, type=float)
     parser.add_argument('--mosaic', default=1.0, type=float)
     parser.add_argument('--mix_up', default=0.0, type=float)
+    parser.add_argument('--use_albumentations', action='store_true')
     
     if sys.argv.__len__() == 2:
         parser.convert_arg_line_to_args = util.convert_arg_line_to_args
@@ -357,6 +368,7 @@ def main():
         args = parser.parse_args([arg_filename_with_prefix])
     else:
         args = parser.parse_args()
+        
     if args.config != '':
         args = parser.parse_args()
         yaml_data = yaml.safe_load(open(args.config))#, Loader=yaml.FullLoader)
@@ -367,6 +379,8 @@ def main():
                     args_dict[key].append(v)
             else:
                 args_dict[key] = value 
+
+    assert args.train or args.test, "You must specify either --train or --test"
                 
     args.local_rank = int(os.getenv('LOCAL_RANK', 0))
     args.world_size = int(os.getenv('WORLD_SIZE', 1))
@@ -380,13 +394,24 @@ def main():
         if not os.path.exists('weights'):
             os.makedirs('weights')
 
-    util.setup_seed()
+    util.setup_seed(args.seed)
     util.setup_multi_processes()
 
     profile(args)
 
     if args.train:
+
+        # record config file for reproduction
+        time_stamp = time.strftime("%Y_%m_%d_%H_%M_%S", time.localtime())
+        args.log_dir = os.path.join(args.log_dir, time_stamp)        
+        os.makedirs(args.log_dir, exist_ok=True)
+        
+        train_config_path = os.path.join(args.log_dir, f"train_config.yml")
+        with open(train_config_path, 'w+') as f:
+            yaml.dump(args.__dict__, f)
+            
         train(args)
+        
     if args.test:
         test(args)
 
@@ -397,4 +422,7 @@ def main():
 
 
 if __name__ == "__main__":
+    
+
+    
     main()
