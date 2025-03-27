@@ -43,14 +43,14 @@ def train(args):#, params):
         ckpt = f"v11_{args.variant}.pt"
         if not os.path.exists(ckpt):
             os.system(f"wget https://github.com/jahongir7174/YOLOv11-pt/releases/download/v0.0.1/v11_{args.variant}.pt")
-            dst = model.state_dict()
-            src = torch.load(ckpt, 'cpu', weights_only=False)['model'].float().state_dict()
-            ckpt = {}
-            for k, v in src.items():
-                if k in dst and v.shape == dst[k].shape:
-                    print(k)
-                    ckpt[k] = v
-            model.load_state_dict(state_dict=ckpt, strict=False)
+        dst = model.state_dict()
+        src = torch.load(ckpt, 'cpu', weights_only=False)['model'].float().state_dict()
+        ckpt = {}
+        for k, v in src.items():
+            if k in dst and v.shape == dst[k].shape:
+                print(k)
+                ckpt[k] = v
+        model.load_state_dict(state_dict=ckpt, strict=False)
 
     # Optimizer
     accumulate = max(round(64 / (args.batch_size * args.world_size)), 1)
