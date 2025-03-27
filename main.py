@@ -1,6 +1,7 @@
 import copy
 import csv
 import os
+import sys
 import warnings
 from argparse import ArgumentParser
 
@@ -15,32 +16,60 @@ from utils.dataset import Dataset
 
 warnings.filterwarnings("ignore")
 
-data_dir = '../Dataset/COCO'
+# data_dir = '../Dataset/COCO'
 
 
-def train(args, params):
+def train(args):#, params):
     # Model
-    model = nn.yolo_v11_n(len(params['names']))
+    # variant = params["variant"]
+    if args.variant == "n":
+        model = nn.yolo_v11_n(len(args.names))
+    elif args.variant == "s":
+        model = nn.yolo_v11_s(len(args.names))
+    elif args.variant == "m":
+        model = nn.yolo_v11_m(len(args.names))
+    elif args.variant == "l":
+        model = nn.yolo_v11_l(len(args.names))
+    elif args.variant == "t":
+        model = nn.yolo_v11_t(len(args.names))
+    else:
+        model = nn.yolo_v11_x(len(args.names))
+    
     model.cuda()
+    
+    #Load pretrained models
+    if args.pretrained:
+        ckpt = f"v11_{args.variant}.pt"
+        if not os.path.exists(ckpt):
+            os.system(f"wget https://github.com/jahongir7174/YOLOv11-pt/releases/download/v0.0.1/v11_{args.variant}.pt")
+            dst = model.state_dict()
+            src = torch.load(ckpt, 'cpu', weights_only=False)['model'].float().state_dict()
+            ckpt = {}
+            for k, v in src.items():
+                if k in dst and v.shape == dst[k].shape:
+                    print(k)
+                    ckpt[k] = v
+            model.load_state_dict(state_dict=ckpt, strict=False)
 
     # Optimizer
     accumulate = max(round(64 / (args.batch_size * args.world_size)), 1)
-    params['weight_decay'] *= args.batch_size * args.world_size * accumulate / 64
+    args.weight_decay *= args.batch_size * args.world_size * accumulate / 64
 
-    optimizer = torch.optim.SGD(util.set_params(model, params['weight_decay']),
-                                params['min_lr'], params['momentum'], nesterov=True)
+    optimizer = torch.optim.SGD(util.set_params(model, args.weight_decay),
+                                args.min_lr, args.momentum, nesterov=True)
 
     # EMA
     ema = util.EMA(model) if args.local_rank == 0 else None
 
+    # Dataset
     filenames = []
-    with open(f'{data_dir}/train2017.txt') as f:
-        for filename in f.readlines():
-            filename = os.path.basename(filename.rstrip())
-            filenames.append(f'{data_dir}/images/train2017/' + filename)
+    # with open(f'{data_dir}/train2017.txt') as f:
+    #     for filename in f.readlines():
+    #         filename = os.path.basename(filename.rstrip())
+    #         filenames.append(f'{data_dir}/images/train2017/' + filename)
 
     sampler = None
-    dataset = Dataset(filenames, args.input_size, params, augment=True)
+    dataset = Dataset(args)#filenames, args.input_size, args, augment=True)
 
     if args.distributed:
         sampler = data.distributed.DistributedSampler(dataset)
@@ -50,7 +79,7 @@ def train(args, params):
 
     # Scheduler
     num_steps = len(loader)
-    scheduler = util.LinearLR(args, params, num_steps)
+    scheduler = util.LinearLR(args, num_steps)
 
     if args.distributed:
         # DDP mode
@@ -59,9 +88,11 @@ def train(args, params):
                                                           device_ids=[args.local_rank],
                                                           output_device=args.local_rank)
 
-    best = 0
+    best = [-1, -1, -1, -1]
+    cache_last = [-1, -1, -1, -1]
+    metrics = ["mAP", "mAP50", "recall", "precision"]
     amp_scale = torch.amp.GradScaler()
-    criterion = util.ComputeLoss(model, params)
+    criterion = util.ComputeLoss(model, args)
 
     with open('weights/step.csv', 'w') as log:
         if args.local_rank == 0:
@@ -134,7 +165,7 @@ def train(args, params):
 
             if args.local_rank == 0:
                 # mAP
-                last = test(args, params, ema.ema)
+                last = test(args, ema.ema)
 
                 logger.writerow({'epoch': str(epoch + 1).zfill(3),
                                  'box': str(f'{avg_box_loss.avg:.3f}'),
@@ -147,33 +178,41 @@ def train(args, params):
                 log.flush()
 
                 # Update best mAP
-                if last[0] > best:
-                    best = last[0]
+                for i, metric in enumerate(metrics):
+                    
+                    # Save model
+                    save = {'epoch': epoch + 1,
+                            'model': copy.deepcopy(ema.ema)}
 
-                # Save model
-                save = {'epoch': epoch + 1,
-                        'model': copy.deepcopy(ema.ema)}
+                    if last[i] > best[i]:
+                        # Delete old best (if exists) and save new best
+                        if best[i] != -1:
+                            os.system(f'rm ./weights/best_{metric}_{best[i]}.pt')
+                        best[i] = last[i]
+                        torch.save(save, f=f'./weights/best_{metric}_{best[i]}.pt')
 
-                # Save last, best and delete
-                torch.save(save, f='./weights/last.pt')
-                if best == last[0]:
-                    torch.save(save, f='./weights/best.pt')
-                del save
+                    # Delete old last (if exists) and save new last
+                    if cache_last[i] != -1:
+                        os.system(f'rm ./weights/last_{metric}_{cache_last[i]}.pt')
+                    cache_last[i] = last[i]
+                    torch.save(save, f=f'./weights/last_{metric}_{cache_last[i]}.pt')
+
+                    del save
 
     if args.local_rank == 0:
-        util.strip_optimizer('./weights/best.pt')  # strip optimizers
-        util.strip_optimizer('./weights/last.pt')  # strip optimizers
-
+        for i, metric in enumerate(metrics):
+            util.strip_optimizer(f'./weights/best_{metric}_{best[i]}.pt')  # strip optimizers
+            util.strip_optimizer(f'./weights/last_{metric}_{cache_last[i]}.pt')  # strip optimizers
 
 @torch.no_grad()
-def test(args, params, model=None):
-    filenames = []
-    with open(f'{data_dir}/val2017.txt') as f:
-        for filename in f.readlines():
-            filename = os.path.basename(filename.rstrip())
-            filenames.append(f'{data_dir}/images/val2017/' + filename)
+def test(args, model=None):
+    # filenames = []
+    # with open(f'{data_dir}/val2017.txt') as f:
+    #     for filename in f.readlines():
+    #         filename = os.path.basename(filename.rstrip())
+    #         filenames.append(f'{data_dir}/images/val2017/' + filename)
 
-    dataset = Dataset(filenames, args.input_size, params, augment=False)
+    dataset = Dataset(args)#filenames, args.input_size, augment=args.use_augment)
     loader = data.DataLoader(dataset, batch_size=4, shuffle=False, num_workers=4,
                              pin_memory=True, collate_fn=Dataset.collate_fn)
 
@@ -231,7 +270,7 @@ def test(args, params, model=None):
     # Compute metrics
     metrics = [torch.cat(x, dim=0).cpu().numpy() for x in zip(*metrics)]  # to numpy
     if len(metrics) and metrics[0].any():
-        tp, fp, m_pre, m_rec, map50, mean_ap = util.compute_ap(*metrics, plot=plot, names=params["names"])
+        _, _, m_pre, m_rec, map50, mean_ap = util.compute_ap(*metrics, plot=plot, names=args.names)
     # Print results
     print(('%10s' + '%10.3g' * 4) % ('', m_pre, m_rec, map50, mean_ap))
     # Return results
@@ -239,10 +278,22 @@ def test(args, params, model=None):
     return mean_ap, map50, m_rec, m_pre
 
 
-def profile(args, params):
+def profile(args):#, params):
     import thop
     shape = (1, 3, args.input_size, args.input_size)
-    model = nn.yolo_v11_n(len(params['names'])).fuse()
+    
+    if args.variant == "n":
+        model = nn.yolo_v11_n(len(args.names)).fuse()
+    elif args.variant == "s":
+        model = nn.yolo_v11_s(len(args.names)).fuse()
+    elif args.variant == "m":
+        model = nn.yolo_v11_m(len(args.names)).fuse()
+    elif args.variant == "l":
+        model = nn.yolo_v11_l(len(args.names)).fuse()
+    elif args.variant == "t":
+        model = nn.yolo_v11_t(len(args.names)).fuse()
+    else:
+        model = nn.yolo_v11_x(len(args.names)).fuse()
 
     model.eval()
     model(torch.zeros(shape))
@@ -258,16 +309,65 @@ def profile(args, params):
 
 def main():
     parser = ArgumentParser()
+    
+    parser.add_argument('-c', '--config', help="configuration file *.yml", type=str, required=False, default='')
+
+    parser.add_argument('--variant', default='n', type=str)
+    parser.add_argument('--pretrained', action='store_true')
+
+    parser.add_argument('--names',                            help='Class list (default is [])',                              default = [], type=lambda s: [str(item) for item in s.split(',')])
+
     parser.add_argument('--input-size', default=640, type=int)
     parser.add_argument('--batch-size', default=32, type=int)
     parser.add_argument('--local-rank', default=0, type=int)
     parser.add_argument('--local_rank', default=0, type=int)
     parser.add_argument('--epochs', default=600, type=int)
+    
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--test', action='store_true')
+        
+    # training hyperparams
+    parser.add_argument('--min_lr', default=1e-4, type=float)
+    parser.add_argument('--max_lr', default=1e-2, type=float)
+    parser.add_argument('--momentum', default=0.937, type=float)
+    parser.add_argument('--weight-decay', default=5e-4, type=float)
+    parser.add_argument('--warmup-epochs', default=3, type=int)
+    parser.add_argument('--box', default=0.05, type=float)
+    parser.add_argument('--cls', default=0.5, type=float)
+    parser.add_argument('--dfl', default=0.5, type=float)
+    
+    # augmentation hyperparams
+    parser.add_argument('--use_augment', action='store_true')
 
-    args = parser.parse_args()
-
+    parser.add_argument('--hsv_h', default=0.015, type=float)
+    parser.add_argument('--hsv_s', default=0.7, type=float)
+    parser.add_argument('--hsv_v', default=0.4, type=float)
+    parser.add_argument('--degrees', default=0.0, type=float)
+    parser.add_argument('--translate', default=0.1, type=float)
+    parser.add_argument('--scale', default=0.5, type=float)
+    parser.add_argument('--shear', default=0.0, type=float)
+    parser.add_argument('--flip_ud', default=0.0, type=float)
+    parser.add_argument('--flip_lr', default=0.0, type=float)
+    parser.add_argument('--mosaic', default=1.0, type=float)
+    parser.add_argument('--mix_up', default=0.0, type=float)
+    
+    if sys.argv.__len__() == 2:
+        parser.convert_arg_line_to_args = util.convert_arg_line_to_args
+        arg_filename_with_prefix = '@' + sys.argv[1]
+        args = parser.parse_args([arg_filename_with_prefix])
+    else:
+        args = parser.parse_args()
+    if args.config != '':
+        args = parser.parse_args()
+        yaml_data = yaml.safe_load(open(args.config))#, Loader=yaml.FullLoader)
+        args_dict = args.__dict__
+        for key, value in yaml_data.items():
+            if isinstance(value, list):
+                for v in value:
+                    args_dict[key].append(v)
+            else:
+                args_dict[key] = value 
+                
     args.local_rank = int(os.getenv('LOCAL_RANK', 0))
     args.world_size = int(os.getenv('WORLD_SIZE', 1))
     args.distributed = int(os.getenv('WORLD_SIZE', 1)) > 1
@@ -280,18 +380,15 @@ def main():
         if not os.path.exists('weights'):
             os.makedirs('weights')
 
-    with open('utils/args.yaml', errors='ignore') as f:
-        params = yaml.safe_load(f)
-
     util.setup_seed()
     util.setup_multi_processes()
 
-    profile(args, params)
+    profile(args)
 
     if args.train:
-        train(args, params)
+        train(args)
     if args.test:
-        test(args, params)
+        test(args)
 
     # Clean
     if args.distributed:

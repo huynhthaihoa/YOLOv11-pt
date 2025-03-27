@@ -8,6 +8,11 @@ import torch
 import torchvision
 from torch.nn.functional import cross_entropy
 
+def convert_arg_line_to_args(arg_line):
+    for arg in arg_line.split():
+        if not arg.strip():
+            continue
+        yield arg
 
 def setup_seed():
     """
@@ -396,11 +401,11 @@ def plot_lr(args, optimizer, scheduler, num_steps):
 
 
 class CosineLR:
-    def __init__(self, args, params, num_steps):
-        max_lr = params['max_lr']
-        min_lr = params['min_lr']
+    def __init__(self, args, num_steps):
+        max_lr = args.max_lr
+        min_lr = args.min_lr
 
-        warmup_steps = int(max(params['warmup_epochs'] * num_steps, 100))
+        warmup_steps = int(max(args.warmup_epochs * num_steps, 100))
         decay_steps = int(args.epochs * num_steps - warmup_steps)
 
         warmup_lr = numpy.linspace(min_lr, max_lr, int(warmup_steps))
@@ -419,10 +424,10 @@ class CosineLR:
 
 class LinearLR:
     def __init__(self, args, params, num_steps):
-        max_lr = params['max_lr']
-        min_lr = params['min_lr']
+        max_lr = args.max_lr
+        min_lr = args.min_lr
 
-        warmup_steps = int(max(params['warmup_epochs'] * num_steps, 100))
+        warmup_steps = int(max(args.warmup_epochs * num_steps, 100))
         decay_steps = int(args.epochs * num_steps - warmup_steps)
 
         warmup_lr = numpy.linspace(min_lr, max_lr, int(warmup_steps), endpoint=False)
@@ -762,8 +767,8 @@ class ComputeLoss:
                                                target_scores,
                                                target_scores_sum, fg_mask)
 
-        loss_box *= self.params['box']  # box gain
-        loss_cls *= self.params['cls']  # cls gain
-        loss_dfl *= self.params['dfl']  # dfl gain
+        loss_box *= self.args.box  # box gain
+        loss_cls *= self.args.cls  # cls gain
+        loss_dfl *= self.args.dfl  # dfl gain
 
         return loss_box, loss_cls, loss_dfl

@@ -12,29 +12,31 @@ FORMATS = 'bmp', 'dng', 'jpeg', 'jpg', 'mpo', 'png', 'tif', 'tiff', 'webp'
 
 
 class Dataset(data.Dataset):
-    def __init__(self, filenames, input_size, params, augment):
+    def __init__(self, params):# filenames, input_size, params, augment):
         self.params = params
-        self.mosaic = augment
-        self.augment = augment
-        self.input_size = input_size
+        self.mosaic = self.params.use_augment
+        self.augment = self.params.use_augment
+        self.input_size = self.params.input_size
 
         # Read labels
-        labels = self.load_label(filenames)
+        labels = self.load_label(self.params.filenames)
         self.labels = list(labels.values())
         self.filenames = list(labels.keys())  # update
         self.n = len(self.filenames)  # number of samples
         self.indices = range(self.n)
         # Albumentations (optional, only used if package is installed)
-        self.albumentations = Albumentations()
+        
+        if self.params.use_albumentations:
+            self.albumentations = Albumentations()
 
     def __getitem__(self, index):
         index = self.indices[index]
 
-        if self.mosaic and random.random() < self.params['mosaic']:
+        if self.mosaic and random.random() < self.params.mosaic:
             # Load MOSAIC
             image, label = self.load_mosaic(index, self.params)
             # MixUp augmentation
-            if random.random() < self.params['mix_up']:
+            if random.random() < self.params.mix_up:
                 index = random.choice(self.indices)
                 mix_image1, mix_label1 = image, label
                 mix_image2, mix_label2 = self.load_mosaic(index, self.params)
@@ -61,18 +63,21 @@ class Dataset(data.Dataset):
         box = xy2wh(box, w, h)
 
         if self.augment:
+            
             # Albumentations
-            image, box, cls = self.albumentations(image, box, cls)
+            if self.params.use_albumentations:
+                image, box, cls = self.albumentations(image, box, cls)
+                
             nl = len(box)  # update after albumentations
             # HSV color-space
             augment_hsv(image, self.params)
             # Flip up-down
-            if random.random() < self.params['flip_ud']:
+            if random.random() < self.params.flip_ud:
                 image = numpy.flipud(image)
                 if nl:
                     box[:, 1] = 1 - box[:, 1]
             # Flip left-right
-            if random.random() < self.params['flip_lr']:
+            if random.random() < self.params.flip_lr:
                 image = numpy.fliplr(image)
                 if nl:
                     box[:, 0] = 1 - box[:, 0]
@@ -273,9 +278,9 @@ def resample():
 
 def augment_hsv(image, params):
     # HSV color-space augmentation
-    h = params['hsv_h']
-    s = params['hsv_s']
-    v = params['hsv_v']
+    h = params.hsv_h
+    s = params.hsv_s
+    v = params.hsv_v
 
     r = numpy.random.uniform(-1, 1, 3) * [h, s, v] + 1
     h, s, v = cv2.split(cv2.cvtColor(image, cv2.COLOR_BGR2HSV))
@@ -335,19 +340,19 @@ def random_perspective(image, label, params, border=(0, 0)):
 
     # Rotation and Scale
     rotate = numpy.eye(3)
-    a = random.uniform(-params['degrees'], params['degrees'])
-    s = random.uniform(1 - params['scale'], 1 + params['scale'])
+    a = random.uniform(-params.degrees, params.degrees)
+    s = random.uniform(1 - params.scale, 1 + params.scale)
     rotate[:2] = cv2.getRotationMatrix2D(angle=a, center=(0, 0), scale=s)
 
     # Shear
     shear = numpy.eye(3)
-    shear[0, 1] = math.tan(random.uniform(-params['shear'], params['shear']) * math.pi / 180)
-    shear[1, 0] = math.tan(random.uniform(-params['shear'], params['shear']) * math.pi / 180)
+    shear[0, 1] = math.tan(random.uniform(-params.shear, params.shear) * math.pi / 180)
+    shear[1, 0] = math.tan(random.uniform(-params.shear, params.shear) * math.pi / 180)
 
     # Translation
     translate = numpy.eye(3)
-    translate[0, 2] = random.uniform(0.5 - params['translate'], 0.5 + params['translate']) * w
-    translate[1, 2] = random.uniform(0.5 - params['translate'], 0.5 + params['translate']) * h
+    translate[0, 2] = random.uniform(0.5 - params.translate, 0.5 + params.translate) * w
+    translate[1, 2] = random.uniform(0.5 - params.translate, 0.5 + params.translate) * h
 
     # Combined rotation matrix, order of operations (right to left) is IMPORTANT
     matrix = translate @ shear @ rotate @ perspective @ center
