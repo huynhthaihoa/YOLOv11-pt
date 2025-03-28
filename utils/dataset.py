@@ -16,24 +16,25 @@ FORMATS = 'bmp', 'dng', 'jpeg', 'jpg', 'mpo', 'png', 'tif', 'tiff', 'webp'
 class Dataset(data.Dataset):
     def __init__(self, params, for_training=True, use_augment=True):# filenames, input_size, params, augment):
         self.params = params
-        self.mosaic = self.params.use_augment
-        self.augment = use_augment#self.params.use_augment
         self.input_size = self.params.input_size
+
+        self.mosaic = use_augment
+        self.augment = use_augment#self.params.use_augment
 
         # Read labels
         if for_training:
-            self.filenames = natsorted(glob(f"{self.params.train_dir}/*.jpg"))
+            filenames = natsorted(glob(f"{self.params.train_dir}/*.jpg"))
         else:
-            self.filenames = natsorted(glob(f"{self.params.val_dir}/*.jpg"))
+            filenames = natsorted(glob(f"{self.params.val_dir}/*.jpg"))
         
-        labels = self.load_label(self.filenames)
+        labels = self.load_label(filenames)
         self.labels = list(labels.values())
         self.filenames = list(labels.keys())  # update
         self.n = len(self.filenames)  # number of samples
         self.indices = range(self.n)
         
         # Albumentations (optional, only used if package is installed)
-        if self.params.use_albumentations:
+        if self.augment and self.params.use_albumentations:
             self.albumentations = Albumentations()
 
     def __getitem__(self, index):
@@ -41,17 +42,19 @@ class Dataset(data.Dataset):
 
         if self.mosaic and random.random() < self.params.mosaic:
             # Load MOSAIC
-            image, label = self.load_mosaic(index, self.params)
+            image, label, image_name = self.load_mosaic(index, self.params)
             # MixUp augmentation
             if random.random() < self.params.mix_up:
                 index = random.choice(self.indices)
-                mix_image1, mix_label1 = image, label
-                mix_image2, mix_label2 = self.load_mosaic(index, self.params)
+                mix_image1, mix_label1, mix_name1 = image, label
+                mix_image2, mix_label2, mix_name2 = self.load_mosaic(index, self.params)
 
                 image, label = mix_up(mix_image1, mix_label1, mix_image2, mix_label2)
+                
+                image_name = f"{mix_name1}+{mix_name2}"
         else:
             # Load image
-            image, shape = self.load_image(index)
+            image, _, image_name = self.load_image(index)
             h, w = image.shape[:2]
 
             # Resize
@@ -98,8 +101,9 @@ class Dataset(data.Dataset):
         # Convert HWC to CHW, BGR to RGB
         sample = image.transpose((2, 0, 1))[::-1]
         sample = numpy.ascontiguousarray(sample)
+        sample = torch.from_numpy(sample).float() / 255.
 
-        return torch.from_numpy(sample), target_cls, target_box, torch.zeros(nl)
+        return sample, target_cls, target_box, torch.zeros(nl), image_name
 
     def __len__(self):
         return len(self.filenames)
@@ -112,7 +116,7 @@ class Dataset(data.Dataset):
             image = cv2.resize(image,
                                dsize=(int(w * r), int(h * r)),
                                interpolation=resample() if self.augment else cv2.INTER_LINEAR)
-        return image, (h, w)
+        return image, (h, w), self.filenames[i]
 
     def load_mosaic(self, index, params):
         label4 = []
@@ -120,6 +124,8 @@ class Dataset(data.Dataset):
         image4 = numpy.full((self.input_size * 2, self.input_size * 2, 3), 0, dtype=numpy.uint8)
         y1a, y2a, x1a, x2a, y1b, y2b, x1b, x2b = (None, None, None, None, None, None, None, None)
 
+        name4 = ""
+        
         xc = int(random.uniform(-border[0], 2 * self.input_size + border[1]))
         yc = int(random.uniform(-border[0], 2 * self.input_size + border[1]))
 
@@ -128,7 +134,7 @@ class Dataset(data.Dataset):
 
         for i, index in enumerate(indices):
             # Load image
-            image, _ = self.load_image(index)
+            image, _, image_name = self.load_image(index)
             shape = image.shape
             if i == 0:  # top left
                 x1a = max(xc - shape[1], 0)
@@ -176,20 +182,25 @@ class Dataset(data.Dataset):
             if len(label):
                 label[:, 1:] = wh2xy(label[:, 1:], shape[1], shape[0], pad_w, pad_h)
             label4.append(label)
+            
+            if len(name4) != 0:
+                name4 += "@"
+            
+            name4 += image_name
 
         # Concat/clip labels
         label4 = numpy.concatenate(label4, 0)
         for x in label4[:, 1:]:
             numpy.clip(x, 0, 2 * self.input_size, out=x)
-
+        
         # Augment
         image4, label4 = random_perspective(image4, label4, params, border)
 
-        return image4, label4
+        return image4, label4, name4
 
     @staticmethod
     def collate_fn(batch):
-        samples, cls, box, indices = zip(*batch)
+        samples, cls, box, indices, names = zip(*batch)
 
         cls = torch.cat(cls, dim=0)
         box = torch.cat(box, dim=0)
@@ -202,7 +213,7 @@ class Dataset(data.Dataset):
         targets = {'cls': cls,
                    'box': box,
                    'idx': indices}
-        return torch.stack(samples, dim=0), targets
+        return torch.stack(samples, dim=0), targets, names
 
     @staticmethod
     def load_label(filenames):

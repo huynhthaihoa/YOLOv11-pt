@@ -1,8 +1,10 @@
 import copy
+import os
 import random
 from time import time
 
 import math
+import cv2
 import numpy
 import torch
 import torchvision
@@ -59,11 +61,13 @@ def export_onnx(args):
     outputs = ['outputs']
     dynamic = {'outputs': {0: 'batch', 1: 'anchors'}}
 
-    m = torch.load('./weights/best.pt')['model'].float()
+    m = torch.load(args.weight_path)['model'].float()
     x = torch.zeros((1, 3, args.input_size, args.input_size))
 
+    output_path = args.weight_path.replace('.pt', '.onnx')
+    
     torch.onnx.export(m.cpu(), x.cpu(),
-                      f='./weights/best.onnx',
+                      f=output_path,
                       verbose=False,
                       opset_version=12,
                       # WARNING: DNN inference with torch>=1.12 may require do_constant_folding=False
@@ -73,10 +77,10 @@ def export_onnx(args):
                       dynamic_axes=dynamic or None)
 
     # Checks
-    model_onnx = onnx.load('./weights/best.onnx')  # load onnx model
+    model_onnx = onnx.load(output_path)  # load onnx model
     onnx.checker.check_model(model_onnx)  # check onnx model
 
-    onnx.save(model_onnx, './weights/best.onnx')
+    onnx.save(model_onnx, output_path)
     # Inference example
     # https://github.com/ultralytics/ultralytics/blob/main/ultralytics/nn/autobackend.py
 
@@ -167,6 +171,7 @@ def non_max_suppression(outputs, confidence_threshold=0.001, iou_threshold=0.65)
         # Batched NMS
         c = x[:, 5:6] * max_wh  # classes
         boxes, scores = x[:, :4] + c, x[:, 4]  # boxes, scores
+
         indices = torchvision.ops.nms(boxes, scores, iou_threshold)  # NMS
         indices = indices[:max_det]  # limit detections
 
@@ -230,7 +235,7 @@ def plot_curve(px, py, names, save_dir, x_label="Confidence", y_label="Metric"):
     pyplot.close(figure)
 
 
-def compute_ap(tp, conf, output, target, plot=False, names=(), eps=1E-16):
+def compute_ap(log_dir, tp, conf, output, target, plot=False, names=(), eps=1E-16):
     """
     Compute the average precision, given the recall and precision curves.
     Source: https://github.com/rafaelpadilla/Object-Detection-Metrics.
@@ -294,10 +299,10 @@ def compute_ap(tp, conf, output, target, plot=False, names=(), eps=1E-16):
     if plot:
         names = dict(enumerate(names))  # to dict
         names = [v for k, v in names.items() if k in unique_classes]  # list: only classes that have data
-        plot_pr_curve(px, py, ap, names, save_dir="./weights/PR_curve.png")
-        plot_curve(px, f1, names, save_dir="./weights/F1_curve.png", y_label="F1")
-        plot_curve(px, p, names, save_dir="./weights/P_curve.png", y_label="Precision")
-        plot_curve(px, r, names, save_dir="./weights/R_curve.png", y_label="Recall")
+        plot_pr_curve(px, py, ap, names, save_dir=f"{log_dir}/PR_curve.png")
+        plot_curve(px, f1, names, save_dir=f"{log_dir}/F1_curve.png", y_label="F1")
+        plot_curve(px, p, names, save_dir=f"{log_dir}/P_curve.png", y_label="Precision")
+        plot_curve(px, r, names, save_dir=f"{log_dir}/R_curve.png", y_label="Recall")
     i = smooth(f1.mean(0), 0.1).argmax()  # max F1 index
     p, r, f1 = p[:, i], r[:, i], f1[:, i]
     tp = (r * nt).round()  # true positives
@@ -350,13 +355,14 @@ def clip_gradients(model, max_norm=10.0):
     torch.nn.utils.clip_grad_norm_(parameters, max_norm=max_norm)
 
 
-def load_weight(model, ckpt):
+def load_weight(model, ckpt_path):
     dst = model.state_dict()
-    src = torch.load(ckpt)['model'].float().cpu()
+    src = torch.load(ckpt_path, 'cpu', weights_only=False)['model'].float().cpu()
 
     ckpt = {}
     for k, v in src.state_dict().items():
         if k in dst and v.shape == dst[k].shape:
+            print(k)
             ckpt[k] = v
 
     model.load_state_dict(state_dict=ckpt, strict=False)
@@ -399,9 +405,34 @@ def plot_lr(args, optimizer, scheduler, num_steps):
     pyplot.grid()
     pyplot.xlim(0, args.epochs * num_steps)
     pyplot.ylim(0)
-    pyplot.savefig('./weights/lr.png', dpi=200)
+    pyplot.savefig(f'{args.log_dir}/lr.png', dpi=200)
     pyplot.close()
 
+def plot_bboxes(color_dict, image_path, height, width, output, gt_cls, gt_box, save_dir):
+    
+    scale = numpy.array([width, height, width, height])
+    
+    image = cv2.imread(image_path)
+    pred_image = cv2.resize(image, (width, height))
+    gt_image = pred_image.copy()
+    
+    # visualize prediction
+    pred_bbox = wh2xy(output[:, :4].cpu().detach().numpy()) #* scale
+    for i in range(len(pred_bbox)):
+        color = color_dict[int(output[i][5].cpu().detach())]
+        cv2.rectangle(pred_image, (int(pred_bbox[i][0]), int(pred_bbox[i][1])), (int(pred_bbox[i][2]), int(pred_bbox[i][3])), color, 2)
+        cv2.putText(pred_image, "{:.2f}".format(output[i][4].cpu().detach()), (int(pred_bbox[i][0]) + 10, int(pred_bbox[i][1]) + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    
+    # visualize ground truth
+    gt_bbox = wh2xy(gt_box.cpu().detach()) * scale
+    for i in range(len(gt_bbox)):
+        color = color_dict[int(gt_cls[i][0])]
+        cv2.rectangle(gt_image, (int(gt_bbox[i][0]), int(gt_bbox[i][1])), (int(gt_bbox[i][2]), int(gt_bbox[i][3])), color, 2)
+    
+    vis = numpy.hstack([pred_image, gt_image])
+        
+    save_path = os.path.join(save_dir, os.path.basename(image_path))
+    cv2.imwrite(save_path, vis)
 
 class CosineLR:
     def __init__(self, args, num_steps):
@@ -427,8 +458,8 @@ class CosineLR:
 
 class LinearLR:
     def __init__(self, args, num_steps):
-        max_lr = args.max_lr
-        min_lr = args.min_lr
+        max_lr = args.lrf * args.lr0
+        min_lr = args.lr0
 
         warmup_steps = int(max(args.warmup_epochs * num_steps, 100))
         decay_steps = int(args.epochs * num_steps - warmup_steps)

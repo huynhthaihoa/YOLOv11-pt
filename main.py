@@ -1,14 +1,20 @@
 import copy
 import csv
 import os
+import random
 import sys
 import warnings
 import time
-from argparse import ArgumentParser
 
+import cv2
 import torch
 import tqdm
 import yaml
+import numpy
+
+from argparse import ArgumentParser
+from loguru import logger
+
 from torch.utils import data
 
 from nets import nn
@@ -38,29 +44,38 @@ def train(args):#, params):
     
     model.cuda()
     
-    #Load pretrained models
+    #Load MS COCO pretrained model
     if args.pretrained:
         ckpt = f"v11_{args.variant}.pt"
         if not os.path.exists(ckpt):
             os.system(f"wget https://github.com/jahongir7174/YOLOv11-pt/releases/download/v0.0.1/v11_{args.variant}.pt")
-        dst = model.state_dict()
-        src = torch.load(ckpt, 'cpu', weights_only=False)['model'].float().state_dict()
-        ckpt = {}
-        for k, v in src.items():
-            if k in dst and v.shape == dst[k].shape:
-                print(k)
-                ckpt[k] = v
-        model.load_state_dict(state_dict=ckpt, strict=False)
+        # dst = model.state_dict()
+        # src = torch.load(ckpt, 'cpu', weights_only=False)['model'].float().state_dict()
+        model = util.load_weight(model, ckpt)
+        # ckpt = {}
+        # for k, v in src.items():
+        #     if k in dst and v.shape == dst[k].shape:
+        #         print(k)
+        #         ckpt[k] = v
+        # model.load_state_dict(state_dict=ckpt, strict=False)
 
+    # Load custom pretrained model
+    if args.weight_path:
+        model = util.load_weight(model, args.weight_path)
+    
     # Optimizer
     accumulate = max(round(64 / (args.batch_size * args.world_size)), 1)
     args.weight_decay *= args.batch_size * args.world_size * accumulate / 64
 
     optimizer = torch.optim.SGD(util.set_params(model, args.weight_decay),
-                                args.min_lr, args.momentum, nesterov=True)
+                                args.lr0, args.momentum, nesterov=True)
 
     # EMA
-    ema = util.EMA(model) if args.local_rank == 0 else None
+    if args.use_ema and args.local_rank == 0:
+        ema = util.EMA(model) 
+    else:
+        ema = None
+    # if args.local_rank == 0 else None
 
     # Dataset
     # filenames = []
@@ -79,6 +94,10 @@ def train(args):#, params):
     loader = data.DataLoader(dataset, args.batch_size, sampler is None, sampler,
                              num_workers=8, pin_memory=True, collate_fn=Dataset.collate_fn)
 
+    eval_dataset = Dataset(args, False, False)
+    eval_loader = data.DataLoader(eval_dataset, batch_size=4, shuffle=False, num_workers=4,
+                             pin_memory=True, collate_fn=Dataset.collate_fn)
+    
     # Scheduler
     num_steps = len(loader)
     scheduler = util.LinearLR(args, num_steps)
@@ -93,18 +112,27 @@ def train(args):#, params):
     best = [-1, -1, -1, -1]
     cache_last = [-1, -1, -1, -1]
     metrics = ["mAP", "mAP50", "recall", "precision"]
-    amp_scale = torch.amp.GradScaler()
+    
+    # Auto mixed precision training
+    if args.use_amp:
+        amp_scale = torch.amp.GradScaler()
+    else:
+        amp_scale = None
+        
     criterion = util.ComputeLoss(model, args)
 
     with open(f'{args.log_dir}/step.csv', 'w') as log:
         if args.local_rank == 0:
-            logger = csv.DictWriter(log, fieldnames=['epoch',
-                                                     'box', 'cls', 'dfl',
-                                                     'Recall', 'Precision', 'mAP@50', 'mAP'])
-            logger.writeheader()
+            dict_logger = csv.DictWriter(log, fieldnames=['epoch',
+                                                    'box', 'cls', 'dfl',
+                                                    'Recall', 'Precision', 'mAP@50', 'mAP'])
+        dict_logger.writeheader()
 
         for epoch in range(args.epochs):
+            
+            # training part
             model.train()
+            
             if args.distributed:
                 sampler.set_epoch(epoch)
             if args.epochs - epoch == 10:
@@ -120,12 +148,12 @@ def train(args):#, params):
             avg_box_loss = util.AverageMeter()
             avg_cls_loss = util.AverageMeter()
             avg_dfl_loss = util.AverageMeter()
-            for i, (samples, targets) in p_bar:
+            for i, (samples, targets, _) in p_bar:
 
                 step = i + num_steps * epoch
                 scheduler.step(step, optimizer)
 
-                samples = samples.cuda().float() / 255
+                samples = samples.cuda()#.float() #/ 255
 
                 # Forward
                 with torch.amp.autocast('cuda'):
@@ -142,19 +170,33 @@ def train(args):#, params):
                 loss_box *= args.world_size  # gradient averaged between devices in DDP mode
                 loss_cls *= args.world_size  # gradient averaged between devices in DDP mode
                 loss_dfl *= args.world_size  # gradient averaged between devices in DDP mode
+                
+                total_loss = loss_box + loss_cls + loss_dfl
+                
+                if args.use_amp:
+                    # Backward
+                    amp_scale.scale(total_loss).backward()
 
-                # Backward
-                amp_scale.scale(loss_box + loss_cls + loss_dfl).backward()
+                    # Optimize
+                    if step % accumulate == 0:
+                        # amp_scale.unscale_(optimizer)  # unscale gradients
+                        # util.clip_gradients(model)  # clip gradients
+                        amp_scale.step(optimizer)  # optimizer.step
+                        amp_scale.update()
+                        optimizer.zero_grad()
+                        if ema:
+                            ema.update(model)
+                else:
+                    # Backward
+                    total_loss.backward()
 
-                # Optimize
-                if step % accumulate == 0:
-                    # amp_scale.unscale_(optimizer)  # unscale gradients
-                    # util.clip_gradients(model)  # clip gradients
-                    amp_scale.step(optimizer)  # optimizer.step
-                    amp_scale.update()
-                    optimizer.zero_grad()
-                    if ema:
-                        ema.update(model)
+                    # Optimize
+                    if step % accumulate == 0:
+                        # util.clip_gradients(model)  # clip gradients
+                        optimizer.step()
+                        optimizer.zero_grad()
+                        if ema:
+                            ema.update(model)
 
                 torch.cuda.synchronize()
 
@@ -165,41 +207,51 @@ def train(args):#, params):
                                                        avg_box_loss.avg, avg_cls_loss.avg, avg_dfl_loss.avg)
                     p_bar.set_description(s)
 
-            if args.local_rank == 0:
+            #
+            # ====================================
+            # validation part
+            
+            if ema:
                 # mAP
-                last = test(args, ema.ema)
+                last = test(args, ema.ema, epoch)
+            else:
+                last = test(args, model, epoch)
 
-                logger.writerow({'epoch': str(epoch + 1).zfill(3),
-                                 'box': str(f'{avg_box_loss.avg:.3f}'),
-                                 'cls': str(f'{avg_cls_loss.avg:.3f}'),
-                                 'dfl': str(f'{avg_dfl_loss.avg:.3f}'),
-                                 'mAP': str(f'{last[0]:.3f}'),
-                                 'mAP@50': str(f'{last[1]:.3f}'),
-                                 'Recall': str(f'{last[2]:.3f}'),
-                                 'Precision': str(f'{last[3]:.3f}')})
-                log.flush()
+            dict_logger.writerow({'epoch': str(epoch + 1).zfill(3),
+                                'box': str(f'{avg_box_loss.avg:.3f}'),
+                                'cls': str(f'{avg_cls_loss.avg:.3f}'),
+                                'dfl': str(f'{avg_dfl_loss.avg:.3f}'),
+                                'mAP': str(f'{last[0]:.3f}'),
+                                'mAP@50': str(f'{last[1]:.3f}'),
+                                'Recall': str(f'{last[2]:.3f}'),
+                                'Precision': str(f'{last[3]:.3f}')})
+            log.flush()
 
-                # Update best mAP
-                for i, metric in enumerate(metrics):
-                    
-                    # Save model
+            # Update best mAP
+            for i, metric in enumerate(metrics):
+                
+                # Save model
+                if ema:
                     save = {'epoch': epoch + 1,
                             'model': copy.deepcopy(ema.ema)}
+                else:
+                    save = {'epoch': epoch + 1,
+                            'model': copy.deepcopy(model)}
 
-                    if last[i] > best[i]:
-                        # Delete old best (if exists) and save new best
-                        if best[i] != -1:
-                            os.system(f'rm {args.log_dir}/best_{metric}_{best[i]}.pt')
-                        best[i] = last[i]
-                        torch.save(save, f=f'{args.log_dir}/best_{metric}_{best[i]}.pt')
+                if last[i] > best[i]:
+                    # Delete old best (if exists) and save new best
+                    if best[i] != -1:
+                        os.system(f'rm {args.log_dir}/best_{metric}_{best[i]}.pt')
+                    best[i] = last[i]
+                    torch.save(save, f=f'{args.log_dir}/best_{metric}_{best[i]}.pt')
 
-                    # Delete old last (if exists) and save new last
-                    if cache_last[i] != -1:
-                        os.system(f'rm {args.log_dir}/last_{metric}_{cache_last[i]}.pt')
-                    cache_last[i] = last[i]
-                    torch.save(save, f=f'{args.log_dir}/last_{metric}_{cache_last[i]}.pt')
+                # Delete old last (if exists) and save new last
+                if cache_last[i] != -1:
+                    os.system(f'rm {args.log_dir}/last_{metric}_{cache_last[i]}.pt')
+                cache_last[i] = last[i]
+                torch.save(save, f=f'{args.log_dir}/last_{metric}_{cache_last[i]}.pt')
 
-                    del save
+                del save
 
     if args.local_rank == 0:
         for i, metric in enumerate(metrics):
@@ -207,7 +259,7 @@ def train(args):#, params):
             util.strip_optimizer(f'{args.log_dir}/last_{metric}_{cache_last[i]}.pt')  # strip optimizers
 
 @torch.no_grad()
-def test(args, model=None):
+def test(args, model=None, epoch=None):
     # filenames = []
     # with open(f'{data_dir}/val2017.txt') as f:
     #     for filename in f.readlines():
@@ -221,12 +273,57 @@ def test(args, model=None):
     plot = False
     if not model:
         plot = True
-        model = torch.load(f='./weights/best.pt', map_location='cuda')
-        model = model['model'].float().fuse()
+        
+        if args.variant == "n":
+            model = nn.yolo_v11_n(len(args.names))
+        elif args.variant == "s":
+            model = nn.yolo_v11_s(len(args.names))
+        elif args.variant == "m":
+            model = nn.yolo_v11_m(len(args.names))
+        elif args.variant == "l":
+            model = nn.yolo_v11_l(len(args.names))
+        elif args.variant == "t":
+            model = nn.yolo_v11_t(len(args.names))
+        else:
+            model = nn.yolo_v11_x(len(args.names))
+
+        # dst = model.state_dict()
+        # src = torch.load(args.weight, map_location='cpu', weights_only=False)['model'].float().state_dict()
+        # ckpt = {}
+        # for k, v in src.items():
+        #     if k in dst and v.shape == dst[k].shape:
+        #         print(k)
+        #         ckpt[k] = v
+        # model.load_state_dict(state_dict=ckpt, strict=False)
+        model = util.load_weight(model, args.weight_path)
+        model = model.float().fuse().cuda()
 
     model.half()
     model.eval()
-
+    
+    color_dict = dict()
+    color_set = set()
+    n_classes = len(args.names)
+    board = numpy.ones((n_classes * 50 + 10, 100, 3), dtype=numpy.uint8) * 255
+    for i in range(len(args.names)):
+        r = random.randint(0, 255)
+        g = random.randint(0, 255)
+        b = random.randint(0, 255)
+        if (r, g, b) in color_set or (r, g, b) == (255, 255, 255):
+            continue
+        color_dict[i] = (r, g, b)
+        color_set.add((r, g, b))
+        cv2.putText(board, f"{i}. {args.names[i]}", (10, i * 50 + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_dict[i], 1)
+    
+    if epoch:
+        log_dir = f'{args.log_dir}/{epoch}'
+    else:
+        log_dir = args.log_dir
+        
+    os.makedirs(log_dir, exist_ok=True)
+    
+    cv2.imwrite(f'{log_dir}.jpg', board)
+    
     # Configure
     iou_v = torch.linspace(start=0.5, end=0.95, steps=10).cuda()  # iou vector for mAP@0.5:0.95
     n_iou = iou_v.numel()
@@ -237,31 +334,43 @@ def test(args, model=None):
     mean_ap = 0
     metrics = []
     p_bar = tqdm.tqdm(loader, desc=('%10s' * 5) % ('', 'precision', 'recall', 'mAP50', 'mAP'))
-    for samples, targets in p_bar:
-        samples = samples.cuda()
-        samples = samples.half()  # uint8 to fp16/32
-        samples = samples / 255.  # 0 - 255 to 0.0 - 1.0
-        _, _, h, w = samples.shape  # batch-size, channels, height, width
-        scale = torch.tensor((w, h, w, h)).cuda()
-        # Inference
-        outputs = model(samples)
-        # NMS
-        outputs = util.non_max_suppression(outputs)
+    for samples, targets, names in p_bar:
+        with torch.no_grad():    
+            samples = torch.autograd.Variable(samples.cuda())#samples.cuda()
+            samples = samples.half()  # uint8 to fp16/32
+            # samples = samples / 255.  # 0 - 255 to 0.0 - 1.0
+            _, _, h, w = samples.shape  # batch-size, channels, height, width
+            scale = torch.tensor((w, h, w, h)).cuda()
+            
+            # Inference
+            outputs = model(samples)
+        
+        outputs = util.non_max_suppression(outputs, args.conf_thres, args.iou_thres)
+        
         # Metrics
         for i, output in enumerate(outputs):
+
+            # ground truth
             idx = targets['idx'] == i
             cls = targets['cls'][idx]
             box = targets['box'][idx]
 
-            cls = cls.cuda()
-            box = box.cuda()
+            #should visualize from here
+            util.plot_bboxes(color_dict, names[i], h, w, output, cls, box, log_dir)
+            
+            cls = cls.cuda() #(N of boxes, 1)
+            box = box.cuda() #(N of boxes, 4)
 
             metric = torch.zeros(output.shape[0], n_iou, dtype=torch.bool).cuda()
 
             if output.shape[0] == 0:
                 if cls.shape[0]:
+                    logger.warning("Cannot detect anything!")
                     metrics.append((metric, *torch.zeros((2, 0)).cuda(), cls.squeeze(-1)))
                 continue
+            else:
+                logger.info("Detect something!")
+                
             # Evaluate
             if cls.shape[0]:
                 target = torch.cat(tensors=(cls, util.wh2xy(box) * scale), dim=1)
@@ -272,9 +381,13 @@ def test(args, model=None):
     # Compute metrics
     metrics = [torch.cat(x, dim=0).cpu().numpy() for x in zip(*metrics)]  # to numpy
     if len(metrics) and metrics[0].any():
-        _, _, m_pre, m_rec, map50, mean_ap = util.compute_ap(*metrics, plot=plot, names=args.names)
+        _, _, m_pre, m_rec, map50, mean_ap = util.compute_ap(args.log_dir, *metrics, plot=plot, names=args.names)
+    else:
+        logger.warning(f"Something must be wrong here!: {len(metrics)}, {metrics[0].any()}")
+        exit(0)
+        
     # Print results
-    print(('%10s' + '%10.3g' * 4) % ('', m_pre, m_rec, map50, mean_ap))
+    logger.info(('%10s' + '%10.3g' * 4) % ('', m_pre, m_rec, map50, mean_ap))
     # Return results
     model.float()  # for training
     return mean_ap, map50, m_rec, m_pre
@@ -305,8 +418,8 @@ def profile(args):#, params):
     flops, num_params = thop.clever_format(nums=[2 * flops, num_params], format="%.3f")
 
     if args.local_rank == 0:
-        print(f'Number of parameters: {num_params}')
-        print(f'Number of FLOPs: {flops}')
+        logger.info(f'Number of parameters: {num_params}')
+        logger.info(f'Number of FLOPs: {flops}')
 
 
 def main():
@@ -336,16 +449,27 @@ def main():
 
     # Log and save
     parser.add_argument('--log_dir',                   type=str,   help='directory to save checkpoints and summaries', default='')
-        
+    
+    # Load weights
+    parser.add_argument('--weight_path',                     type=str,   help='path to the weights file', required=False)
+    
+    # threshold hyperparams
+    parser.add_argument('--conf_thres', default=0.001, type=float)
+    parser.add_argument('--iou_thres', default=0.6, type=float)
+    
     # training hyperparams
-    parser.add_argument('--min_lr', default=1e-4, type=float)
-    parser.add_argument('--max_lr', default=1e-2, type=float)
+    parser.add_argument('--use_ema', action='store_true')
+    parser.add_argument('--use_amp',                               help='if set, use automatic mixed precision training',           action='store_true')
+
+    parser.add_argument('--lr0', default=1e-4, type=float)
+    parser.add_argument('--lrf', default=1e-2, type=float)
     parser.add_argument('--momentum', default=0.937, type=float)
     parser.add_argument('--weight_decay', default=5e-4, type=float)
     parser.add_argument('--warmup_epochs', default=3, type=int)
-    parser.add_argument('--box', default=0.05, type=float)
-    parser.add_argument('--cls', default=0.5, type=float)
-    parser.add_argument('--dfl', default=0.5, type=float)
+    
+    parser.add_argument('--box', default=0.05, type=float, help='box loss weight')
+    parser.add_argument('--cls', default=0.5, type=float, help='cls loss weight')
+    parser.add_argument('--dfl', default=0.5, type=float, help='dfl loss weight')
    
     # augmentation hyperparams
     parser.add_argument('--use_augment', action='store_true')
@@ -390,9 +514,9 @@ def main():
         torch.cuda.set_device(device=args.local_rank)
         torch.distributed.init_process_group(backend='nccl', init_method='env://')
 
-    if args.local_rank == 0:
-        if not os.path.exists('weights'):
-            os.makedirs('weights')
+    # if args.local_rank == 0:
+    #     if not os.path.exists('weights'):
+    #         os.makedirs('weights')
 
     util.setup_seed(args.seed)
     util.setup_multi_processes()
