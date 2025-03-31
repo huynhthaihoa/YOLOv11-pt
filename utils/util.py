@@ -8,6 +8,7 @@ import cv2
 import numpy
 import torch
 import torchvision
+import torch.nn.functional as F
 from torch.nn.functional import cross_entropy
 
 def convert_arg_line_to_args(arg_line):
@@ -705,6 +706,51 @@ class BoxLoss(torch.nn.Module):
         right_loss = cross_entropy(pred_dist, tr.view(-1), reduction='none').view(tl.shape)
         return (left_loss * wl + right_loss * wr).mean(-1, keepdim=True)
 
+class VarifocalLoss(torch.nn.Module):
+    """
+    Varifocal loss by Zhang et al.
+
+    https://arxiv.org/abs/2008.13367.
+    """
+
+    def __init__(self):
+        """Initialize the VarifocalLoss class."""
+        super().__init__()
+
+    @staticmethod
+    def forward(pred_score, gt_score, label, alpha=0.75, gamma=2.0):
+        """Compute varifocal loss between predictions and ground truth."""
+        weight = alpha * pred_score.sigmoid().pow(gamma) * (1 - label) + gt_score * label
+        with torch.amp.autocast(enabled=False):
+            loss = (
+                (F.binary_cross_entropy_with_logits(pred_score.float(), gt_score.float(), reduction="none") * weight)
+                .mean(1)
+                .sum()
+            )
+        return loss
+
+class CustomBCEWithLogitsLoss(torch.nn.Module):
+    def __init__(self, reduction='none', pos_weight=1, epsilon=10**-44):
+        super().__init__()
+        self.pos_weight = pos_weight
+        self.epsilon = epsilon
+        self.reduction = reduction.lower()
+
+    def forward(self, input, target):
+        
+        input = input.sigmoid().clamp(self.epsilon, 1 - self.epsilon)
+        
+        bce_loss = -1 * (self.pos_weight * target * torch.log(input)
+                          + (1 - target) * torch.log(1 - input))
+        
+        if self.reduction in ['mean', 'sum']:
+            add_loss = (target - 0.5) ** 2 * 4
+            mean_loss = (bce_loss * add_loss)
+            if self.reduction == 'mean':
+                return mean_loss.mean()
+            return mean_loss.sum()
+        
+        return bce_loss    
 
 class ComputeLoss:
     def __init__(self, model, params):
@@ -723,7 +769,9 @@ class ComputeLoss:
         self.device = device
 
         self.box_loss = BoxLoss(m.ch - 1).to(device)
-        self.cls_loss = torch.nn.BCEWithLogitsLoss(reduction='none')
+        
+        self.cls_loss = torch.nn.BCEWithLogitsLoss(reduction=self.params.reduction)
+        
         self.assigner = Assigner(nc=self.nc, top_k=10, alpha=0.5, beta=6.0)
 
         self.project = torch.arange(m.ch, dtype=torch.float, device=device)
@@ -786,9 +834,16 @@ class ComputeLoss:
         target_bboxes, target_scores, fg_mask = assigned_targets
 
         target_scores_sum = max(target_scores.sum(), 1)
+        assert not math.isnan(target_scores_sum), "target_scores_sum is not NaN!"
+        
+        val = self.cls_loss(pred_scores, target_scores.to(data_type))
+        assert not torch.any(torch.isnan(val)), "val is not NaN!"
 
-        loss_cls = self.cls_loss(pred_scores, target_scores.to(data_type)).sum() / target_scores_sum  # BCE
-
+        loss_cls = val.sum() / target_scores_sum  # BCE
+        assert not torch.any(torch.isnan(pred_scores)), "Pred Scores is not NaN!"
+        assert not torch.any(torch.isnan(target_scores)), "Target Scores is not NaN!"
+        assert not torch.any(torch.isnan(loss_cls)), "loss_cls is not NaN!"
+                
         # Box loss
         loss_box = torch.zeros(1, device=self.device)
         loss_dfl = torch.zeros(1, device=self.device)
@@ -806,3 +861,26 @@ class ComputeLoss:
         loss_dfl *= self.params.dfl  # dfl gain
 
         return loss_box, loss_cls, loss_dfl
+
+class EarlyStopping:
+    def __init__(self, patience=7, verbose=False, min_delta=0):
+
+        self.patience = patience
+        self.verbose = verbose
+        self.counter = 0
+        # self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = numpy.inf
+        self.min_delta = min_delta
+
+    def __call__(self, val_loss):#, model):
+        if((val_loss + self.min_delta) < self.val_loss_min):
+            self.val_loss_min = val_loss
+            self.counter = 0
+        elif((val_loss + self.min_delta) > self.val_loss_min):
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+                
+    def percentage(self):
+        return (self.counter / self.patience) * 100

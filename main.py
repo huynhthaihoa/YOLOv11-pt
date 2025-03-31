@@ -66,6 +66,7 @@ def train(args):#, params):
     # Optimizer
     accumulate = max(round(64 / (args.batch_size * args.world_size)), 1)
     args.weight_decay *= args.batch_size * args.world_size * accumulate / 64
+    # end_learning_rate = args.lr0 * args.lrf
 
     optimizer = torch.optim.SGD(util.set_params(model, args.weight_decay),
                                 args.lr0, args.momentum, nesterov=True)
@@ -94,13 +95,22 @@ def train(args):#, params):
     loader = data.DataLoader(dataset, args.batch_size, sampler is None, sampler,
                              num_workers=8, pin_memory=True, collate_fn=Dataset.collate_fn)
 
-    eval_dataset = Dataset(args, False, False)
-    eval_loader = data.DataLoader(eval_dataset, batch_size=4, shuffle=False, num_workers=4,
-                             pin_memory=True, collate_fn=Dataset.collate_fn)
+    # eval_dataset = Dataset(args, False, False)
+    # eval_loader = data.DataLoader(eval_dataset, batch_size=4, shuffle=False, num_workers=4,
+    #                          pin_memory=True, collate_fn=Dataset.collate_fn)
     
     # Scheduler
-    num_steps = len(loader)
-    scheduler = util.LinearLR(args, num_steps)
+    steps_per_epoch = len(loader)
+    # num_total_steps = args.epochs * steps_per_epoch
+    
+    scheduler = util.LinearLR(args, steps_per_epoch)
+
+    # if args.use_early_stopping:
+    #     early_stopping = util.EarlyStopping(patience=args.lr_patience, verbose=True)
+    #     eval_loss_meter = util.AverageMeter()
+    #     eval_avg_box_loss = util.AverageMeter()
+    #     eval_avg_cls_loss = util.AverageMeter()
+    #     eval_avg_dfl_loss = util.AverageMeter()
 
     if args.distributed:
         # DDP mode
@@ -115,9 +125,9 @@ def train(args):#, params):
     
     # Auto mixed precision training
     if args.use_amp:
-        amp_scale = torch.amp.GradScaler()
+        amp_scaler = torch.amp.GradScaler()
     else:
-        amp_scale = None
+        amp_scaler = None
         
     criterion = util.ComputeLoss(model, args)
 
@@ -129,6 +139,9 @@ def train(args):#, params):
         dict_logger.writeheader()
 
         for epoch in range(args.epochs):
+
+            # if args.use_early_stopping and early_stopping.early_stop:
+            #     break             
             
             # training part
             model.train()
@@ -142,23 +155,33 @@ def train(args):#, params):
 
             if args.local_rank == 0:
                 print(('\n' + '%10s' * 5) % ('epoch', 'memory', 'box', 'cls', 'dfl'))
-                p_bar = tqdm.tqdm(p_bar, total=num_steps)
+                p_bar = tqdm.tqdm(p_bar, total=steps_per_epoch)
 
-            optimizer.zero_grad()
             avg_box_loss = util.AverageMeter()
             avg_cls_loss = util.AverageMeter()
             avg_dfl_loss = util.AverageMeter()
             for i, (samples, targets, _) in p_bar:
-
-                step = i + num_steps * epoch
+                
+                step = i + steps_per_epoch * epoch
+                
+                # if args.use_ema:
                 scheduler.step(step, optimizer)
 
                 samples = samples.cuda()#.float() #/ 255
 
-                # Forward
+                assert not torch.any(torch.isnan(samples)), "Input is not NaN!"
+                
+                # Zero your gradients for every batch!
+                optimizer.zero_grad()
+
+                # Forward: Make predictions for this batch
                 with torch.amp.autocast('cuda'):
                     outputs = model(samples)  # forward
                     loss_box, loss_cls, loss_dfl = criterion(outputs, targets)
+
+                assert not torch.any(torch.isnan(loss_box)), "Box Loss is not NaN!"
+                assert not torch.any(torch.isnan(loss_cls)), "Cls Loss is not NaN!"
+                assert not torch.any(torch.isnan(loss_dfl)), "Dfl Loss is not NaN!"
 
                 avg_box_loss.update(loss_box.item(), samples.size(0))
                 avg_cls_loss.update(loss_cls.item(), samples.size(0))
@@ -172,29 +195,39 @@ def train(args):#, params):
                 loss_dfl *= args.world_size  # gradient averaged between devices in DDP mode
                 
                 total_loss = loss_box + loss_cls + loss_dfl
+
+                assert not torch.any(torch.isnan(total_loss)), "Loss is not NaN!"
                 
                 if args.use_amp:
-                    # Backward
-                    amp_scale.scale(total_loss).backward()
+                    # Backward: Compute the loss and its gradients
+                    amp_scaler.scale(total_loss).backward()
 
-                    # Optimize
+                    # Optimize: adjust learning weights
+                    # for param_group in optimizer.param_groups:
+                    #     current_lr = (args.lr0 - end_learning_rate) * (1 - step / num_total_steps) ** 0.9 + end_learning_rate
+                    #     param_group['lr'] = current_lr
+
                     if step % accumulate == 0:
-                        # amp_scale.unscale_(optimizer)  # unscale gradients
+                        # amp_scaler.unscale_(optimizer)  # unscale gradients
                         # util.clip_gradients(model)  # clip gradients
-                        amp_scale.step(optimizer)  # optimizer.step
-                        amp_scale.update()
-                        optimizer.zero_grad()
+                        amp_scaler.step(optimizer)  # optimizer.step
+                        amp_scaler.update()
+                        # optimizer.zero_grad()
                         if ema:
                             ema.update(model)
                 else:
-                    # Backward
+                    # Backward: Compute the loss and its gradients
                     total_loss.backward()
 
-                    # Optimize
+                    # Optimize: adjust learning weights
+                    # for param_group in optimizer.param_groups:
+                    #     current_lr = (args.lr0 - end_learning_rate) * (1 - step / num_total_steps) ** 0.9 + end_learning_rate
+                    #     param_group['lr'] = current_lr
+
                     if step % accumulate == 0:
                         # util.clip_gradients(model)  # clip gradients
                         optimizer.step()
-                        optimizer.zero_grad()
+                        # optimizer.zero_grad()
                         if ema:
                             ema.update(model)
 
@@ -206,7 +239,9 @@ def train(args):#, params):
                     s = ('%10s' * 2 + '%10.3g' * 3) % (f'{epoch + 1}/{args.epochs}', memory,
                                                        avg_box_loss.avg, avg_cls_loss.avg, avg_dfl_loss.avg)
                     p_bar.set_description(s)
-
+                    
+                # for param in model.parameters():
+                #     print(param.data)
             #
             # ====================================
             # validation part
@@ -216,6 +251,15 @@ def train(args):#, params):
                 last = test(args, ema.ema, epoch)
             else:
                 last = test(args, model, epoch)
+            
+            # if args.use_early_stopping:
+            #     scheduler.step(eval_loss_meter.avg)
+            #     early_stopping(eval_loss_meter.avg)
+            #     if early_stopping.early_stop:
+            #         logger.info("Early stopping!")
+            #         break 
+            #     else:
+            #         logger.info(f"Early stopping counter percentage: {early_stopping.percentage()} %")
 
             dict_logger.writerow({'epoch': str(epoch + 1).zfill(3),
                                 'box': str(f'{avg_box_loss.avg:.3f}'),
@@ -287,20 +331,13 @@ def test(args, model=None, epoch=None):
         else:
             model = nn.yolo_v11_x(len(args.names))
 
-        # dst = model.state_dict()
-        # src = torch.load(args.weight, map_location='cpu', weights_only=False)['model'].float().state_dict()
-        # ckpt = {}
-        # for k, v in src.items():
-        #     if k in dst and v.shape == dst[k].shape:
-        #         print(k)
-        #         ckpt[k] = v
-        # model.load_state_dict(state_dict=ckpt, strict=False)
         model = util.load_weight(model, args.weight_path)
         model = model.float().fuse().cuda()
 
     model.half()
     model.eval()
     
+    # class color pallete
     color_dict = dict()
     color_set = set()
     n_classes = len(args.names)
@@ -314,15 +351,15 @@ def test(args, model=None, epoch=None):
         color_dict[i] = (r, g, b)
         color_set.add((r, g, b))
         cv2.putText(board, f"{i}. {args.names[i]}", (10, i * 50 + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_dict[i], 1)
-    
     if epoch:
         log_dir = f'{args.log_dir}/{epoch}'
     else:
         log_dir = args.log_dir
-        
     os.makedirs(log_dir, exist_ok=True)
-    
     cv2.imwrite(f'{log_dir}.jpg', board)
+    
+    # if eval_loss_meter:
+    #     eval_criterion = util.ComputeLoss(model, args)
     
     # Configure
     iou_v = torch.linspace(start=0.5, end=0.95, steps=10).cuda()  # iou vector for mAP@0.5:0.95
@@ -365,11 +402,11 @@ def test(args, model=None, epoch=None):
 
             if output.shape[0] == 0:
                 if cls.shape[0]:
-                    logger.warning("Cannot detect anything!")
+                    # logger.warning("Cannot detect anything!")
                     metrics.append((metric, *torch.zeros((2, 0)).cuda(), cls.squeeze(-1)))
                 continue
-            else:
-                logger.info("Detect something!")
+            # else:
+            #     logger.info("Detect something!")
                 
             # Evaluate
             if cls.shape[0]:
@@ -460,12 +497,16 @@ def main():
     # training hyperparams
     parser.add_argument('--use_ema', action='store_true')
     parser.add_argument('--use_amp',                               help='if set, use automatic mixed precision training',           action='store_true')
+    parser.add_argument('--reduction', default='none', type=str)
 
     parser.add_argument('--lr0', default=1e-4, type=float)
     parser.add_argument('--lrf', default=1e-2, type=float)
     parser.add_argument('--momentum', default=0.937, type=float)
     parser.add_argument('--weight_decay', default=5e-4, type=float)
     parser.add_argument('--warmup_epochs', default=3, type=int)
+
+    parser.add_argument('--use_early_stopping',                    help='if set, use early stopping', action='store_true')
+    parser.add_argument('--lr_patience',               type=int,   help='learning rate patience threshold', default=5)
     
     parser.add_argument('--box', default=0.05, type=float, help='box loss weight')
     parser.add_argument('--cls', default=0.5, type=float, help='cls loss weight')
