@@ -770,6 +770,7 @@ class ComputeLoss:
 
         self.box_loss = BoxLoss(m.ch - 1).to(device)
         
+        # if reduction is 'none' or 'sum', the loss may become NaN after some epochs
         self.cls_loss = torch.nn.BCEWithLogitsLoss(reduction=self.params.reduction)
         
         self.assigner = Assigner(nc=self.nc, top_k=10, alpha=0.5, beta=6.0)
