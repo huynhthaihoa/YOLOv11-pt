@@ -424,7 +424,7 @@ def test(args, model=None, epoch=None):
         exit(0)
         
     # Print results
-    logger.info(('%10s' + '%10.3g' * 4) % ('', m_pre, m_rec, map50, mean_ap))
+    print(('%10s' + '%10.3g' * 4) % ('', m_pre, m_rec, map50, mean_ap))
     # Return results
     model.float()  # for training
     return mean_ap, map50, m_rec, m_pre
